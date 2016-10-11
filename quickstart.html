@@ -1,0 +1,195 @@
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>video-chat-room</title>
+</head>
+
+<body style="background:#333;color:#fff;text-align: center;">
+    <div id="getAppid-div" style="text-align:center;margin-top:150px;">
+        <input id="roomId" type="" style="width:200px;height:35px;" name="" placeholder='请输入房间号'>
+        <button id="login" onclick="join()" style="height:35px;width:70px;border: 1px solid;border-radius: 3px;cursor:pointer">进入</button>
+    </div>
+    <div id="videos" style="text-align:center;margin:0px auto;margin-top:60px;" hidden="">
+        <video id="local" style="border:1px solid;width:480px;height:360px;margin-top:20px;" muted="" autoplay=""></video>
+        <video id="remote" style="border:1px solid;width:480px;height:360px;margin-left:50px;margin-top:20px;" autoplay="" hidden></video>
+    </div>
+    <script type="text/javascript" src='https://cdn.wilddog.com/sdk/js/2.0.0/wilddog.js'></script>
+    <script type="text/javascript" src='https://cdn.wilddog.com/sdk/js/0.4.0/wilddog-video.js'></script>
+    <script type="text/javascript">
+    //获取所使用到的所有元素
+    var roomIdEl = document.getElementById('roomId');
+    var videosEl = document.getElementById('videos');
+    var localEl = document.getElementById('local');
+    var remoteEl = document.getElementById('remote');
+    var loginDiv = document.getElementById('getAppid-div');
+    var localStream = null;
+
+    var roomId = null;
+
+    var currentConversation = null;
+    //获取Video对象
+    var videoInstance = wilddog.video();
+    //获取Client对象
+    var clientInstance = videoInstance.client();
+
+    var config = {
+        authDomain: 'dongkai.wilddog.com',
+        syncURL: "https://dongkai.wilddogio.com/videoChatRoom"
+    }
+
+    wilddog.initializeApp(config);
+    //定义wilddog.video交互路径
+    var wilddogref = wilddog.sync().ref();
+    //定义quickstart使用的房间列表存储路径
+    var roomsRef = wilddog.sync().ref().parent().child('roomList');
+
+    var currentUser = null;
+
+    //页面初始化后，检查用户是否已经登录，未登录则自动匿名登录;
+    wilddog.auth().onAuthStateChanged((user) => {
+        if (user == null) {
+            wilddog.auth().signInAnonymously()
+                .then()
+                .catch((err) => {
+                    console.error('请检查appid是否正确并开启匿名登录功能！');
+                })
+        }
+    })
+
+    //加入房间
+    var join = function() {
+
+        //拿到房间号
+        roomId = roomIdEl.value;
+
+        //wilddog.video.client.init()需要传入wilddog.ref和wilddog.user，因此需监听wilddog.auth的状态
+        wilddog.auth().onAuthStateChanged((user) => {
+            //如果user为null,不作任何操作，等待匿名登录成功后再进行
+            if (user == null) {
+                return;
+            }
+
+            //匿名登录成功了
+            currentUser = user;
+            loginDiv.hidden = true;
+            videosEl.hidden = false;
+
+            //Client初始化操作，执行必须在匿名登录之后进行，client的其他函数必须在init成功后才可调用
+            clientInstance.init({
+                    ref: wilddogref,
+                    user: user
+                })
+                .then(() => {
+                    //获取本地媒体流，并绑定到页面。client的邀请会话函数需要传入媒体流，因此，我们在创建本地媒体流成功后再进行client的其他操作
+                    return videoInstance.createStream({
+                        audio: true,
+                        video: 'low'
+                    })
+                })
+                .catch((err) => {
+                    console.error(err);
+                })
+                .then((wdStream) => {
+
+                    localStream = wdStream;
+                    //将本地媒体流绑定到页面
+                    localStream.attach(localEl);
+
+                    //将自己的uid存入之前输入的房间号的节点下,value为野狗服务器时间戳
+                    roomsRef.child(roomId + '/' + currentUser.uid).set(wilddog.sync().ServerValue.TIMESTAMP)
+                        .then(() => {
+                            //监听其他用户的加入事件
+                            roomsRef.child(roomId).on('child_added', (snapshot) => {
+                                //如果监听到是自己，则不做任何操作
+                                if (snapshot.key() == currentUser.uid) {
+                                    return;
+                                }
+                                //查询此时房间内最早加入的uid
+                                roomsRef.child(roomId).orderByValue().limitToFirst(1).once('child_added', (snap) => {
+                                    console.log(snap.key(), snap.val());
+                                    //如果最早加入的不是自己，不做任何操作
+                                    if (snap.key() != currentUser.uid) {
+                                        return;
+                                    }
+                                    //如果最早加入的uid是自己的uid，那么负责邀请新加入的用户
+                                    //如果已经加入conversation，调用conversation.invite()进行邀请，否则调用client.inviteToConversation()进行邀请
+                                    if (currentConversation) {
+                                        currentConversation.invite(snapshot.key())
+                                    } else {
+                                        clientInstance.inviteToConversation({
+                                            'mode': 'p2p',
+                                            'participantId': snapshot.key(),
+                                            'localStream': localStream,
+                                        }).then((conversation) => {
+
+                                            currentConversation = conversation;
+
+                                            //监听新参与者加入conversation
+                                            conversation.on('participant_connected', (participant) => {
+                                                var newRemote = remoteEl.cloneNode(true);
+                                                newRemote.id = participant.participantId;
+                                                newRemote.hidden = false;
+                                                videosEl.appendChild(newRemote);
+                                                participant.stream.attach(newRemote);
+                                            });
+
+                                            //监听参与者离开conversation
+                                            conversation.on('participant_disconnected', (participant) => {
+                                                var removeEl = document.getElementById(participant.participantId);
+                                                participant.stream.detach(removeEl);
+                                                videosEl.removeChild(removeEl);
+                                                console.log(participant.participantId);
+                                                console.log('participant_disconnected');
+                                            });
+                                        })
+                                    }
+
+                                })
+
+                            })
+                        })
+                    //断线则将自己删除
+                    roomsRef.child(roomId + '/' + currentUser.uid).onDisconnect().remove();
+
+                    //监听收到的邀请
+                    clientInstance.on('invite', (incomingInvite) => {
+                        //如果已经加入conversation,则不处理邀请
+                        if (currentConversation) {
+                            return;
+                        }
+                        incomingInvite.accept(localStream)
+                            .then((conversation) => {
+                                currentConversation = conversation;
+                                //监听新参与者加入conversation
+                                conversation.on('participant_connected', (participant) => {
+                                    var newRemote = remoteEl.cloneNode(true);
+                                    newRemote.id = participant.participantId;
+                                    newRemote.hidden = false;
+                                    videosEl.appendChild(newRemote);
+                                    participant.stream.attach(newRemote);
+                                });
+                                //监听会话参与者的断开事件
+                                conversation.on('participant_disconnected', (participant) => {
+                                    var removeEl = document.getElementById(participant.participantId);
+                                    participant.stream.detach(removeEl);
+                                    videosEl.removeChild(removeEl);
+                                    console.log(participant.participantId);
+                                    console.log('participant_disconnected');
+                                });
+                            })
+                            .catch(function(err) {
+                                console.error(err);
+                            });
+                    });
+                })
+                .catch((err) => {
+                    console.error(err);
+                })
+        })
+
+    }
+    </script>
+</body>
+
+</html>
